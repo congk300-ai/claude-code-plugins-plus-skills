@@ -393,6 +393,15 @@ def score_ease_of_use(path: Path, body: str, fm: dict) -> dict:
         meta_notes.append("missing allowed-tools")
     if fm.get('author') and '@' in str(fm.get('author', '')):
         meta_score += 1
+    if fm.get('tags') and isinstance(fm.get('tags'), list) and len(fm['tags']) > 0:
+        meta_score += 1
+    else:
+        meta_notes.append("missing tags")
+    if fm.get('compatible-with'):
+        meta_score += 1
+    else:
+        meta_notes.append("missing compatible-with")
+    meta_score = min(meta_score, 10)
     breakdown['metadata_quality'] = (meta_score, ", ".join(meta_notes) if meta_notes else "Complete metadata")
 
     # Discoverability (6 pts)
@@ -604,8 +613,21 @@ def score_spec_compliance(path: Path, body: str, fm: dict) -> dict:
         opt_notes.append("optional fields ok")
     breakdown['optional_fields'] = (opt_score, ", ".join(opt_notes))
 
+    # Field Coverage (3 pts) — percentage of applicable fields present
+    all_applicable = set(SKILL_FIELDS.keys())
+    present_fields = set(fm.keys()) & all_applicable
+    coverage_pct = len(present_fields) / len(all_applicable) * 100 if all_applicable else 0
+    if coverage_pct >= 80:
+        breakdown['field_coverage'] = (3, f"Excellent: {len(present_fields)}/{len(all_applicable)} fields ({coverage_pct:.0f}%)")
+    elif coverage_pct >= 60:
+        breakdown['field_coverage'] = (2, f"Good: {len(present_fields)}/{len(all_applicable)} fields ({coverage_pct:.0f}%)")
+    elif coverage_pct >= 40:
+        breakdown['field_coverage'] = (1, f"Fair: {len(present_fields)}/{len(all_applicable)} fields ({coverage_pct:.0f}%)")
+    else:
+        breakdown['field_coverage'] = (0, f"Low: {len(present_fields)}/{len(all_applicable)} fields ({coverage_pct:.0f}%)")
+
     total = sum(v[0] for v in breakdown.values())
-    return {'score': total, 'max': 15, 'breakdown': breakdown}
+    return {'score': total, 'max': 18, 'breakdown': breakdown}
 
 
 def score_writing_style(path: Path, body: str, fm: dict) -> dict:
@@ -720,10 +742,25 @@ def calculate_modifiers(path: Path, body: str, fm: dict) -> dict:
     if '<' in body and '>' in body and re.search(r'<[a-z]+>', body):
         modifiers['xml_tags'] = (-1, "XML-like tags in body")
 
+    # Stub penalty: body <30 lines with no code blocks and no references/ -3
+    skill_dir = path.parent
+    if lines < 30:
+        code_blocks = len(re.findall(r'```', body)) // 2
+        refs_dir = skill_dir / "references"
+        if code_blocks == 0 and not refs_dir.exists():
+            modifiers['stub_penalty'] = (-3, f"Stub skill: {lines} lines, no code blocks, no references/")
+
+    # Supporting files bonus: has references/ with real content +1
+    refs_dir = skill_dir / "references"
+    if refs_dir.exists():
+        ref_files = [f for f in refs_dir.glob("*.md") if f.stat().st_size > 100]
+        if ref_files:
+            modifiers['supporting_files'] = (+1, f"Has references/ with {len(ref_files)} substantial files")
+
     total = sum(v[0] for v in modifiers.values())
     # Cap modifiers at ±15
     total = max(-15, min(15, total))
-    return {'score': total, 'max_bonus': 5, 'max_penalty': -5, 'items': modifiers}
+    return {'score': total, 'max_bonus': 6, 'max_penalty': -8, 'items': modifiers}
 
 
 def grade_skill(path: Path, body: str, fm: dict) -> dict:
@@ -2261,6 +2298,76 @@ def advise_dci_opportunities(path: Path, body: str) -> List[str]:
     return infos
 
 
+def validate_supporting_files(path: Path) -> Tuple[List[str], List[str]]:
+    """Check supporting file requirements for a skill.
+    - references/ directory must exist (enterprise)
+    - references/ must have content (not empty files)
+    - scripts/ must exist if SKILL.md uses ${CLAUDE_SKILL_DIR}/scripts/
+    """
+    errors: List[str] = []
+    warnings: List[str] = []
+    skill_dir = path.parent
+
+    refs_dir = skill_dir / "references"
+    if not refs_dir.exists():
+        warnings.append("[supporting] Missing references/ directory — create it for progressive disclosure")
+    elif refs_dir.exists():
+        ref_files = list(refs_dir.glob("*.md"))
+        if not ref_files:
+            warnings.append("[supporting] references/ directory is empty — add reference documents")
+        else:
+            for ref_file in ref_files:
+                if ref_file.stat().st_size == 0:
+                    warnings.append(f"[supporting] references/{ref_file.name} is empty (0 bytes)")
+
+    # Check for singular reference.md (anti-pattern)
+    if (skill_dir / "reference.md").exists():
+        errors.append("[supporting] Found 'reference.md' (singular) — rename to references/ directory with .md files inside")
+
+    return errors, warnings
+
+
+def detect_stub_skill(path: Path, body: str, fm: dict) -> Tuple[List[str], List[str]]:
+    """Detect if a SKILL.md is a stub (insufficient content).
+    A skill is a stub if ANY of:
+    - Body < 30 lines
+    - Zero code blocks AND zero markdown links to supporting files
+    - Description matches generic patterns
+    - No ## Instructions section
+    """
+    errors: List[str] = []
+    warnings: List[str] = []
+    lines = body.strip().splitlines()
+
+    # Skip stub detection for fork skills (they're intentionally minimal)
+    if fm.get('context') == 'fork':
+        return errors, warnings
+
+    stub_reasons = []
+
+    if len(lines) < 30:
+        stub_reasons.append(f"body is only {len(lines)} lines (minimum 30)")
+
+    code_blocks = len(re.findall(r'```', body)) // 2
+    md_links = len(re.findall(r'\[.*?\]\((?!https?://)[^)]+\)', body))
+    if code_blocks == 0 and md_links == 0:
+        stub_reasons.append("no code blocks and no relative links to supporting files")
+
+    desc = str(fm.get('description', '')).lower()
+    generic_patterns = ['a helpful tool', 'this skill provides', 'enables claude to']
+    if any(p in desc for p in generic_patterns) and 'use when' not in desc:
+        stub_reasons.append("description is generic with no 'use when' phrase")
+
+    has_instructions = bool(re.search(r'(?mi)^##\s+instructions', body))
+    if not has_instructions:
+        stub_reasons.append("missing ## Instructions section")
+
+    if len(stub_reasons) >= 2:
+        warnings.append(f"[stub] Skill appears to be a stub: {'; '.join(stub_reasons)}")
+
+    return errors, warnings
+
+
 def validate_skill(path: Path, tier: str = TIER_STANDARD) -> Dict[str, Any]:
     """
     Validate a single SKILL.md file.
@@ -2338,6 +2445,17 @@ def validate_skill(path: Path, tier: str = TIER_STANDARD) -> Dict[str, Any]:
     errors.extend(boilerplate_errors)
     warnings.extend(boilerplate_warnings)
 
+    # Supporting files check (enterprise tier)
+    if tier == TIER_ENTERPRISE:
+        sf_errors, sf_warnings = validate_supporting_files(path)
+        errors.extend(sf_errors)
+        warnings.extend(sf_warnings)
+
+    # Stub detection
+    stub_skill_errors, stub_skill_warnings = detect_stub_skill(path, body, fm)
+    errors.extend(stub_skill_errors)
+    warnings.extend(stub_skill_warnings)
+
     # Enterprise-tier quality checks (warnings only)
     if tier == TIER_ENTERPRISE:
         line_len_errors, line_len_warnings = check_line_character_length(body)
@@ -2375,6 +2493,113 @@ def validate_skill(path: Path, tier: str = TIER_STANDARD) -> Dict[str, Any]:
         'line_count': len(body.splitlines()),
         'description_length': len(description),
         'grade': grade_result,
+    }
+
+
+def validate_plugin(plugin_dir: Path, tier: str = TIER_STANDARD) -> Dict[str, Any]:
+    """Validate a plugin as a complete unit.
+    Walks all components and rolls up scores.
+    """
+    errors: List[str] = []
+    warnings: List[str] = []
+    infos: List[str] = []
+
+    plugin_json_path = plugin_dir / '.claude-plugin' / 'plugin.json'
+
+    # 1. Validate plugin.json
+    if plugin_json_path.exists():
+        try:
+            pj = json_module.loads(plugin_json_path.read_text(encoding='utf-8'))
+            if not isinstance(pj, dict):
+                errors.append("[plugin.json] Must be a JSON object")
+            else:
+                # Check required field
+                if 'name' not in pj:
+                    errors.append("[plugin.json] Missing required field: 'name'")
+
+                # Check for invalid fields
+                valid_fields = set(PLUGIN_JSON_FIELDS.keys())
+                for key in pj:
+                    if key not in valid_fields:
+                        errors.append(f"[plugin.json] Unknown field: '{key}' — not in Anthropic spec")
+        except json_module.JSONDecodeError as e:
+            errors.append(f"[plugin.json] Invalid JSON: {e}")
+    else:
+        warnings.append("[plugin.json] No .claude-plugin/plugin.json found")
+
+    # 2. Validate skills
+    skill_results = []
+    skills_dir = plugin_dir / 'skills'
+    if skills_dir.exists():
+        for skill_md in skills_dir.rglob('SKILL.md'):
+            result = validate_skill(skill_md, tier)
+            skill_results.append((skill_md, result))
+
+    # 3. Validate agents
+    agent_results = []
+    agents_dir = plugin_dir / 'agents'
+    if agents_dir.exists():
+        for agent_md in agents_dir.glob('*.md'):
+            result = validate_agent(agent_md)
+            agent_results.append((agent_md, result))
+
+    # 4. Validate commands (legacy — warn to migrate)
+    commands_dir = plugin_dir / 'commands'
+    if commands_dir.exists():
+        cmd_files = list(commands_dir.glob('*.md'))
+        if cmd_files:
+            infos.append(f"[plugin] commands/ directory has {len(cmd_files)} files — consider migrating to skills/")
+        for cmd_md in cmd_files:
+            result = validate_command(cmd_md)
+            if result.get('errors'):
+                errors.extend(result['errors'])
+            if result.get('warnings'):
+                warnings.extend(result['warnings'])
+
+    # 5. Check optional config files
+    if (plugin_dir / 'hooks' / 'hooks.json').exists():
+        try:
+            json_module.loads((plugin_dir / 'hooks' / 'hooks.json').read_text(encoding='utf-8'))
+        except (json_module.JSONDecodeError, Exception) as e:
+            errors.append(f"[plugin] hooks/hooks.json is invalid: {e}")
+
+    if (plugin_dir / '.mcp.json').exists():
+        try:
+            json_module.loads((plugin_dir / '.mcp.json').read_text(encoding='utf-8'))
+        except (json_module.JSONDecodeError, Exception) as e:
+            errors.append(f"[plugin] .mcp.json is invalid: {e}")
+
+    # Roll up results
+    skill_scores = []
+    for skill_path, result in skill_results:
+        rel = skill_path.relative_to(plugin_dir)
+        if result.get('fatal'):
+            errors.append(f"[skill] {rel}: FATAL - {result['fatal']}")
+        else:
+            errors.extend(result.get('errors', []))
+            warnings.extend(result.get('warnings', []))
+            grade = result.get('grade', {})
+            if grade.get('score'):
+                skill_scores.append(grade['score'])
+
+    for agent_path, result in agent_results:
+        rel = agent_path.relative_to(plugin_dir)
+        if result.get('fatal'):
+            errors.append(f"[agent] {rel}: FATAL - {result['fatal']}")
+        else:
+            errors.extend(result.get('errors', []))
+            warnings.extend(result.get('warnings', []))
+
+    avg_score = sum(skill_scores) / len(skill_scores) if skill_scores else 0
+
+    return {
+        'errors': errors,
+        'warnings': warnings,
+        'infos': infos,
+        'skill_count': len(skill_results),
+        'agent_count': len(agent_results),
+        'avg_skill_score': avg_score,
+        'type': 'plugin',
     }
 
 
@@ -2466,8 +2691,27 @@ def main() -> int:
         if not target.exists():
             print(f"ERROR: File not found: {args.path}", file=sys.stderr)
             return 1
-        if target.name != 'SKILL.md' and not target.name.endswith('.md'):
-            print(f"ERROR: Expected a SKILL.md or .md file: {args.path}", file=sys.stderr)
+        if target.is_dir():
+            # Plugin directory mode
+            result = validate_plugin(target, tier)
+            print(f"🔍 CLAUDE CODE PLUGIN VALIDATOR v5.0 ({tier} tier)")
+            print(f"   Plugin mode: {target}")
+            print(f"{'=' * 70}\n")
+            if result['errors']:
+                for error in result['errors']:
+                    print(f"   ERROR: {error}")
+            if result['warnings']:
+                for warning in result['warnings']:
+                    print(f"   WARN: {warning}")
+            if result.get('infos'):
+                for info in result['infos']:
+                    print(f"   INFO: {info}")
+            print(f"\n   Skills: {result['skill_count']}, Agents: {result['agent_count']}")
+            if result['avg_skill_score']:
+                print(f"   Average skill score: {result['avg_skill_score']:.1f}/100")
+            return 1 if result['errors'] else 0
+        elif target.name != 'SKILL.md' and not target.name.endswith('.md'):
+            print(f"ERROR: Expected a SKILL.md, .md file, or plugin directory: {args.path}", file=sys.stderr)
             return 1
 
         print(f"🔍 CLAUDE CODE PLUGIN VALIDATOR v5.0 ({tier} tier)")
